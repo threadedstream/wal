@@ -2,7 +2,9 @@ package wal
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,28 +40,65 @@ type Opts struct {
 }
 
 type segmentIterator struct {
-	reader *bufio.Reader
+	reader   *bufio.Reader
+	segments []string
+	currIdx  int
+}
+
+func newSegmentIterator(segments []string) (*segmentIterator, error) {
+	file, err := os.OpenFile(segments[0], os.O_RDONLY, 0666)
+	if err != nil {
+		return nil, err
+	}
+
+	return &segmentIterator{
+		segments: segments,
+		currIdx:  1,
+		reader:   bufio.NewReader(file),
+	}, nil
 }
 
 func (si *segmentIterator) Next() ([]byte, error) {
-	return si.readRecord()
+	res, err := si.readRecord()
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+
+	if errors.Is(err, io.EOF) {
+		// open next segment and read record from there
+		if err = si.nextSegment(); err != nil {
+			return nil, err
+		}
+
+		return si.readRecord()
+	}
+
+	return res, nil
+}
+
+func (si *segmentIterator) nextSegment() error {
+	if si.currIdx+1 < len(si.segments) {
+		// garbage collect old reader
+		si.reader = nil
+		si.currIdx++
+		file, err := os.OpenFile(si.segments[si.currIdx], os.O_RDONLY, 0666)
+		if err != nil {
+			return err
+		}
+		si.reader = bufio.NewReader(file)
+	}
+	return io.EOF
 }
 
 func (si *segmentIterator) readRecord() ([]byte, error) {
 	var dataLen [4]byte
 	_, err := si.reader.Read(dataLen[:])
 	if err != nil {
-		if err == io.EOF {
-			return nil, nil
-		}
 		return nil, err
 	}
 	data := make([]byte, enc.Uint32(dataLen[:]))
 	_, err = si.reader.Read(data)
 	if err != nil {
-		if err == io.EOF {
-			return nil, nil
-		}
 		return nil, err
 	}
 	return data, err
@@ -66,15 +106,17 @@ func (si *segmentIterator) readRecord() ([]byte, error) {
 
 // WriteAheadLog implements WAL functionality
 type WriteAheadLog struct {
-	buf         *bufio.Writer
+	writer      *bytes.Buffer
 	file        *os.File
 	off         int
 	segmentsNum int
 	opts        Opts
 	done        chan struct{}
 	logger      *zap.Logger
+	mtx         sync.RWMutex
 }
 
+// NewWriteAheadLog returns a WAL instance, should be called once
 func NewWriteAheadLog(logger *zap.Logger, opts Opts) (*WriteAheadLog, error) {
 	wal := &WriteAheadLog{
 		done:   make(chan struct{}),
@@ -94,23 +136,36 @@ func NewWriteAheadLog(logger *zap.Logger, opts Opts) (*WriteAheadLog, error) {
 	}
 	wal.fixOpts()
 
+	wal.writer = bytes.NewBuffer(make([]byte, 0, opts.SegmentSize))
+
 	go wal.checkpoint()
 
 	return wal, nil
 }
 
-func (wal *WriteAheadLog) getLastSegmentNum() (int, error) {
+func (wal *WriteAheadLog) getSegments() ([]string, error) {
 	filenames, err := filepath.Glob(fmt.Sprintf("%s/*", wal.opts.Dir))
 	if err != nil {
 		wal.logger.Error("failed to glob", zap.Error(err))
 	}
 	if len(filenames) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 
 	sort.Strings(filenames)
+	return filenames, nil
+}
 
-	split := strings.Split(filenames[len(filenames)-1], "/")
+func (wal *WriteAheadLog) getLastSegmentNum() (int, error) {
+	segments, err := wal.getSegments()
+	if err != nil {
+		return 0, err
+	}
+	if len(segments) == 0 {
+		return 0, nil
+	}
+
+	split := strings.Split(segments[len(segments)-1], "/")
 
 	return strconv.Atoi(split[len(split)-1])
 }
@@ -123,28 +178,40 @@ func (wal *WriteAheadLog) fixOpts() {
 
 // Write writes data to internal buffer
 func (wal *WriteAheadLog) Write(data []byte) error {
+	wal.mtx.Lock()
+	defer wal.mtx.Unlock()
 	return wal.write(data)
 }
 
 // Replay calls f on wal data
-func (wal *WriteAheadLog) Replay(idx int, f func(chunk []byte) error) error {
-	file, err := os.OpenFile(fmt.Sprintf("%s/%d", wal.opts.Dir, idx), os.O_RDONLY, 0666)
+func (wal *WriteAheadLog) Replay(f func(chunk []byte) error) error {
+	wal.mtx.RLock()
+	defer wal.mtx.RUnlock()
+
+	segments, err := wal.getSegments()
 	if err != nil {
 		return err
 	}
 
-	iterator := &segmentIterator{
-		reader: bufio.NewReader(file),
+	if len(segments) == 0 {
+		return nil
+	}
+
+	iterator, err := newSegmentIterator(segments)
+	if err != nil {
+		return err
 	}
 
 	for {
 		data, err := iterator.Next()
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
-		if data == nil {
+
+		if errors.Is(err, io.EOF) || data == nil {
 			break
 		}
+
 		if err = f(data); err != nil {
 			return err
 		}
@@ -154,11 +221,14 @@ func (wal *WriteAheadLog) Replay(idx int, f func(chunk []byte) error) error {
 }
 
 func (wal *WriteAheadLog) commit() error {
-	if err := wal.buf.Flush(); err != nil {
-		return fmt.Errorf("failed to flush data: %w", err)
-	}
+	if wal.writer.Len() >= wal.opts.SegmentSize {
+		if _, err := wal.writer.WriteTo(wal.file); err != nil {
+			return err
+		}
 
-	return wal.file.Sync()
+		return wal.file.Sync()
+	}
+	return nil
 }
 
 // Close closes WAL
@@ -199,7 +269,7 @@ func (wal *WriteAheadLog) write(data []byte) error {
 	}
 	var dataLen [4]byte
 	enc.PutUint32(dataLen[:], uint32(len(data)))
-	written, err := wal.buf.Write(dataLen[:])
+	written, err := wal.writer.Write(dataLen[:])
 	if err != nil {
 		return err
 	}
@@ -207,7 +277,7 @@ func (wal *WriteAheadLog) write(data []byte) error {
 		return fmt.Errorf("expected to write %d bytes, wrote %d", 4, written)
 	}
 
-	written, err = wal.buf.Write(data)
+	written, err = wal.writer.Write(data)
 	if err != nil {
 		return err
 	}
@@ -221,6 +291,15 @@ func (wal *WriteAheadLog) write(data []byte) error {
 
 func (wal *WriteAheadLog) openNewSegment() error {
 	wal.segmentsNum++
+
+	// flush previous buffer, just in case it had any data
+	if _, err := wal.writer.WriteTo(wal.file); err != nil {
+		return err
+	}
+
+	// garbage collect the old writer
+	wal.writer.Reset()
+
 	if err := wal.file.Close(); err != nil {
 		return err
 	}
@@ -231,12 +310,8 @@ func (wal *WriteAheadLog) openNewSegment() error {
 	}
 	wal.file = newFile
 
-	// flush previous buffer, just in case it had any data
-	if err = wal.buf.Flush(); err != nil {
-		return err
-	}
-
-	wal.buf = bufio.NewWriter(wal.file)
+	// zero off out
+	wal.off = 0
 
 	return nil
 }
