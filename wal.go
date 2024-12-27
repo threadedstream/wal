@@ -1,7 +1,6 @@
 package wal
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -40,7 +39,7 @@ type Opts struct {
 }
 
 type segmentIterator struct {
-	reader   *bufio.Reader
+	reader   io.Reader
 	segments []string
 	currIdx  int
 }
@@ -53,8 +52,7 @@ func newSegmentIterator(segments []string) (*segmentIterator, error) {
 
 	return &segmentIterator{
 		segments: segments,
-		currIdx:  1,
-		reader:   bufio.NewReader(file),
+		reader:   file,
 	}, nil
 }
 
@@ -66,7 +64,7 @@ func (si *segmentIterator) Next() ([]byte, error) {
 
 	if errors.Is(err, io.EOF) {
 		// open next segment and read record from there
-		if err = si.nextSegment(); err != nil {
+		if err := si.nextSegment(); err != nil {
 			return nil, err
 		}
 
@@ -77,15 +75,14 @@ func (si *segmentIterator) Next() ([]byte, error) {
 }
 
 func (si *segmentIterator) nextSegment() error {
-	if si.currIdx+1 < len(si.segments) {
-		// garbage collect old reader
-		si.reader = nil
+	if (si.currIdx + 1) < len(si.segments) {
 		si.currIdx++
 		file, err := os.OpenFile(si.segments[si.currIdx], os.O_RDONLY, 0666)
 		if err != nil {
 			return err
 		}
-		si.reader = bufio.NewReader(file)
+		si.reader = file
+		return nil
 	}
 	return io.EOF
 }
@@ -98,8 +95,8 @@ func (si *segmentIterator) readRecord() ([]byte, error) {
 	}
 	data := make([]byte, enc.Uint32(dataLen[:]))
 	_, err = si.reader.Read(data)
-	if err != nil {
-		return nil, err
+	if data == nil {
+		println("break")
 	}
 	return data, err
 }
@@ -221,14 +218,14 @@ func (wal *WriteAheadLog) Replay(f func(chunk []byte) error) error {
 }
 
 func (wal *WriteAheadLog) commit() error {
-	if wal.writer.Len() >= wal.opts.SegmentSize {
-		if _, err := wal.writer.WriteTo(wal.file); err != nil {
-			return err
-		}
-
-		return wal.file.Sync()
+	wal.mtx.Lock()
+	defer wal.mtx.Unlock()
+	if _, err := wal.writer.WriteTo(wal.file); err != nil {
+		return err
 	}
-	return nil
+	wal.writer.Reset()
+
+	return wal.file.Sync()
 }
 
 // Close closes WAL

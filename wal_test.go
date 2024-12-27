@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -30,6 +31,8 @@ func TestWALWrite(t *testing.T) {
 		require.NoError(t, wal.Write(dataToWrite[i]))
 	}
 
+	time.Sleep(time.Second * 11)
+
 	replayedData := make([][]byte, 0, 1000)
 	fn := func(data []byte) error {
 		replayedData = append(replayedData, data)
@@ -39,9 +42,6 @@ func TestWALWrite(t *testing.T) {
 	require.NoError(t, wal.Replay(fn))
 
 	require.Equal(t, replayedData, dataToWrite)
-}
-
-func BenchmarkTestWALWrite(b *testing.B) {
 }
 
 func newLogger() *zap.Logger {
