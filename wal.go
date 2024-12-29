@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -20,6 +21,9 @@ import (
 const (
 	KB = 1 * 1024
 	MB = KB * 1024
+
+	entrySizeBytes    = 4
+	checksumSizeBytes = 4
 )
 
 const (
@@ -93,11 +97,22 @@ func (si *segmentIterator) readRecord() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	var chksm [4]byte
+	_, err = si.reader.Read(chksm[:])
+	if err != nil {
+		return nil, err
+	}
+
 	data := make([]byte, enc.Uint32(dataLen[:]))
 	_, err = si.reader.Read(data)
 	if data == nil {
 		println("break")
 	}
+
+	if computeChecksum(data) != enc.Uint32(chksm[:]) {
+		return nil, errors.New("checksums don't match")
+	}
+
 	return data, err
 }
 
@@ -258,13 +273,13 @@ func (wal *WriteAheadLog) checkpoint() {
 }
 
 func (wal *WriteAheadLog) write(data []byte) error {
-	if wal.off+len(data)+4 >= wal.opts.SegmentSize {
+	if wal.off+len(data)+checksumSizeBytes+entrySizeBytes >= wal.opts.SegmentSize {
 		// open a new file
 		if err := wal.openNewSegment(); err != nil {
 			return err
 		}
 	}
-	var dataLen [4]byte
+	var dataLen [entrySizeBytes]byte
 	enc.PutUint32(dataLen[:], uint32(len(data)))
 	written, err := wal.writer.Write(dataLen[:])
 	if err != nil {
@@ -272,6 +287,16 @@ func (wal *WriteAheadLog) write(data []byte) error {
 	}
 	if written != len(dataLen) {
 		return fmt.Errorf("expected to write %d bytes, wrote %d", 4, written)
+	}
+
+	var checksum [checksumSizeBytes]byte
+	enc.PutUint32(checksum[:], computeChecksum(data))
+	written, err = wal.writer.Write(checksum[:])
+	if err != nil {
+		return err
+	}
+	if written != checksumSizeBytes {
+		return fmt.Errorf("expected to write %d bytes, wrote %d", checksumSizeBytes, written)
 	}
 
 	written, err = wal.writer.Write(data)
@@ -282,7 +307,7 @@ func (wal *WriteAheadLog) write(data []byte) error {
 		return fmt.Errorf("expected to write %d bytes, wrote %d", len(data), written)
 	}
 
-	wal.off += len(dataLen) + len(data)
+	wal.off += entrySizeBytes + checksumSizeBytes + len(data)
 	return nil
 }
 
@@ -311,4 +336,8 @@ func (wal *WriteAheadLog) openNewSegment() error {
 	wal.off = 0
 
 	return nil
+}
+
+func computeChecksum(data []byte) uint32 {
+	return crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
 }
